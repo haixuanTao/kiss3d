@@ -495,10 +495,19 @@ impl RayTracer {
         // into the change hash below, so toggling the mask rebuilds + restarts.
         let render_layers = camera.render_layers();
 
-        // Cheap content hash (no vertex arrays built); the expensive `gather` only
-        // runs on an actual change.
-        let hash = scene_data::scene_hash(scene, lights, render_layers);
-        let scene_changed = self.gpu_scene.as_ref().is_none_or(|g| g.hash != hash);
+        // Cheap content hashes (no vertex arrays built). A geometry change needs
+        // the expensive `gather` + full GPU rebuild; a transform-only change (rigid
+        // motion) takes the instance/TLAS fast path below.
+        let (geom_hash, xform_hash) = scene_data::scene_hashes(scene, lights, render_layers);
+        let geom_changed = self
+            .gpu_scene
+            .as_ref()
+            .is_none_or(|g| g.geom_hash != geom_hash);
+        let xform_changed = self
+            .gpu_scene
+            .as_ref()
+            .is_some_and(|g| g.xform_hash != xform_hash);
+        let scene_changed = geom_changed || xform_changed;
 
         // While anything is in motion the image is restarting every frame anyway,
         // so trace at a reduced resolution for responsiveness (covers both camera
@@ -554,8 +563,22 @@ impl RayTracer {
         }
 
         if scene_changed {
-            let rt_scene = scene_data::gather(scene, lights, render_layers);
-            self.gpu_scene = Some(GpuScene::build(&rt_scene, self.backend));
+            // Transform-only fast path: rigid motion with unchanged geometry
+            // rewrites the instance transforms and rebuilds just the TLAS.
+            // World-baked emitters can't be moved this way, so emissive scenes
+            // (and any structural mismatch) fall back to the full rebuild.
+            let fast_updated = !geom_changed
+                && self.gpu_scene.as_mut().is_some_and(|g| {
+                    g.num_emitters == 0
+                        && g.update_transforms(
+                            &scene_data::gather_transforms(scene, render_layers),
+                            xform_hash,
+                        )
+                });
+            if !fast_updated {
+                let rt_scene = scene_data::gather(scene, lights, render_layers);
+                self.gpu_scene = Some(GpuScene::build(&rt_scene, self.backend));
+            }
             reset = true;
         }
 

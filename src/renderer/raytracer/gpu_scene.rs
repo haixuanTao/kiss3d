@@ -58,8 +58,26 @@ pub struct GpuScene {
     /// Whether any material opts out of casting shadows. When true, shadow rays use
     /// the per-occluder walk (skipping non-casters) instead of the binary test.
     pub has_non_shadow_caster: bool,
-    /// Content hash of the [`RtScene`] this was built from.
-    pub hash: u64,
+    /// Geometry-content hash of the [`RtScene`] this was built from; a mismatch
+    /// requires a full rebuild.
+    pub geom_hash: u64,
+    /// Transform hash of the [`RtScene`] this was built from (or of the last
+    /// [`Self::update_transforms`]); a mismatch with an unchanged
+    /// [`Self::geom_hash`] only needs the transform fast path.
+    pub xform_hash: u64,
+
+    /// Which backend this scene was built for (selects the update path).
+    backend: RayBackend,
+    /// Instances in gather order with their original mesh/material ids, kept so
+    /// [`Self::update_transforms`] can rewrite transforms without re-gathering.
+    template_instances: Vec<RtInstance>,
+    /// Local-space AABB per mesh (for TLAS bounds on the compute backend).
+    mesh_aabbs: Vec<(Vec3, Vec3)>,
+    /// Per-mesh node/triangle bases (compute: BLAS-local; hardware: tri only).
+    mesh_descs: Vec<RtMeshDesc>,
+    /// Compute backend: fixed node capacity reserved for the TLAS region at the
+    /// head of [`Self::bvh`], so per-mesh BLAS offsets survive TLAS rebuilds.
+    tlas_capacity: u32,
 
     /// Bottom-level acceleration structures, one per mesh (kept alive while
     /// referenced by the TLAS). Hardware backend only.
@@ -147,14 +165,20 @@ impl GpuScene {
             ordered_tris.extend_from_slice(&ordered);
         }
 
+        // Local AABB per mesh, reused by the transform fast path.
+        let mesh_aabbs: Vec<(Vec3, Vec3)> = scene
+            .mesh_ranges
+            .iter()
+            .map(|&r| mesh_local_aabb(&scene.mesh_vertices, r))
+            .collect();
+
         // Top level: BVH over instance world-space AABBs (mesh local AABB
         // transformed by object→world). Reorder instances so leaves are contiguous.
         let inst_bounds: Vec<(Vec3, Vec3)> = scene
             .instances
             .iter()
             .map(|inst| {
-                let r = scene.mesh_ranges[inst.mesh_id as usize];
-                let (lo, hi) = mesh_local_aabb(&scene.mesh_vertices, r);
+                let (lo, hi) = mesh_aabbs[inst.mesh_id as usize];
                 transform_aabb(Mat4::from_cols_array_2d(&inst.object_to_world), lo, hi)
             })
             .collect();
@@ -163,10 +187,14 @@ impl GpuScene {
         // Merge the top- and bottom-level BVHs into a single `bvh` node buffer
         // (TLAS first, then all BLAS nodes) so the compute stage binds one node
         // buffer instead of two — WebGPU only guarantees 8 storage buffers/stage.
-        // The BLAS region starts at `tlas_count`, so each mesh's node base is
-        // shifted by it.
-        let tlas_count = tlas_nodes.len() as u32;
+        // The TLAS region is padded to a fixed capacity (the 2N-1 worst case for N
+        // leaves, rounded to 2N) so the per-mesh BLAS bases — inlined into the
+        // instances — stay valid when [`Self::update_transforms`] rebuilds only
+        // the TLAS in place.
+        let tlas_capacity = (scene.instances.len().max(1) as u32) * 2;
+        assert!(tlas_nodes.len() as u32 <= tlas_capacity);
         let mut bvh_nodes = tlas_nodes;
+        bvh_nodes.resize(tlas_capacity as usize, BvhNode::default());
         bvh_nodes.extend_from_slice(&blas_nodes);
 
         // Reorder instances to match the TLAS leaves and inline each instance's
@@ -177,7 +205,7 @@ impl GpuScene {
             .map(|&i| {
                 let mut inst = scene.instances[i as usize];
                 let desc = mesh_descs[inst.mesh_id as usize];
-                inst.node_offset = tlas_count + desc.node_offset;
+                inst.node_offset = tlas_capacity + desc.node_offset;
                 inst.tri_offset = desc.tri_offset;
                 inst
             })
@@ -205,7 +233,13 @@ impl GpuScene {
                 &scene.emitters,
                 wgpu::BufferUsages::STORAGE,
             ),
-            bvh: buffer_from::<BvhNode>("rt_bvh", &bvh_nodes, wgpu::BufferUsages::STORAGE),
+            // The TLAS head region and the instances are rewritten in place by
+            // the transform fast path, hence COPY_DST.
+            bvh: buffer_from::<BvhNode>(
+                "rt_bvh",
+                &bvh_nodes,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
             // The compute backend inlines the per-mesh node/tri bases into instances
             // and does not bind this buffer; it is kept only for the hardware backend.
             meshes: buffer_from::<RtMeshDesc>(
@@ -216,7 +250,7 @@ impl GpuScene {
             instances: buffer_from::<RtInstance>(
                 "rt_instances",
                 &instances,
-                wgpu::BufferUsages::STORAGE,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             ),
             tex_array: TexArray::build(&scene.textures),
             num_triangles: scene.mesh_triangles.len() as u32,
@@ -224,7 +258,13 @@ impl GpuScene {
             num_emitters: scene.emitters.len() as u32,
             has_translucent: scene.materials.iter().any(|m| m.base_color[3] < 1.0),
             has_non_shadow_caster: scene.materials.iter().any(|m| m.casts_shadows == 0),
-            hash: scene.hash,
+            geom_hash: scene.geom_hash,
+            xform_hash: scene.xform_hash,
+            backend: RayBackend::Software,
+            template_instances: scene.instances.clone(),
+            mesh_aabbs,
+            mesh_descs,
+            tlas_capacity,
             _blas: Vec::new(),
             tlas: None,
         }
@@ -306,7 +346,7 @@ impl GpuScene {
         let instances_buf = buffer_from::<RtInstance>(
             "rt_instances",
             &scene.instances,
-            wgpu::BufferUsages::STORAGE,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
         let tex_array = TexArray::build(&scene.textures);
         // Unused by the hardware pipeline (it traverses the TLAS/BLAS objects), but
@@ -427,10 +467,101 @@ impl GpuScene {
             num_emitters: scene.emitters.len() as u32,
             has_translucent: scene.materials.iter().any(|m| m.base_color[3] < 1.0),
             has_non_shadow_caster: scene.materials.iter().any(|m| m.casts_shadows == 0),
-            hash: scene.hash,
+            geom_hash: scene.geom_hash,
+            xform_hash: scene.xform_hash,
+            backend: RayBackend::Hardware,
+            template_instances: scene.instances.clone(),
+            mesh_aabbs: scene
+                .mesh_ranges
+                .iter()
+                .map(|&r| mesh_local_aabb(&scene.mesh_vertices, r))
+                .collect(),
+            mesh_descs,
+            tlas_capacity: 0,
             _blas: blases,
             tlas: Some(tlas),
         }
+    }
+
+    /// Transform-only fast path: rewrites the per-instance transforms and rebuilds
+    /// just the top-level acceleration structure, keeping every mesh buffer and
+    /// bottom-level structure intact. `transforms` must be the object→world matrix
+    /// of every instance in gather order (see `scene_data::gather_transforms`).
+    ///
+    /// Returns `false` when the update cannot be applied (instance count mismatch
+    /// or TLAS overflow) and the caller must fall back to a full rebuild.
+    pub fn update_transforms(&mut self, transforms: &[Mat4], xform_hash: u64) -> bool {
+        if transforms.len() != self.template_instances.len() {
+            return false;
+        }
+        let ctxt = Context::get();
+
+        for (inst, m) in self.template_instances.iter_mut().zip(transforms) {
+            inst.object_to_world = m.to_cols_array_2d();
+            inst.world_to_object = m.inverse().to_cols_array_2d();
+        }
+
+        match self.backend {
+            RayBackend::Software => {
+                // Rebuild the TLAS over the moved instance bounds and rewrite the
+                // padded TLAS head of the merged `bvh` buffer in place.
+                let inst_bounds: Vec<(Vec3, Vec3)> = self
+                    .template_instances
+                    .iter()
+                    .map(|inst| {
+                        let (lo, hi) = self.mesh_aabbs[inst.mesh_id as usize];
+                        transform_aabb(Mat4::from_cols_array_2d(&inst.object_to_world), lo, hi)
+                    })
+                    .collect();
+                let (mut tlas_nodes, inst_order) = bvh::build_tlas(&inst_bounds);
+                if tlas_nodes.len() as u32 > self.tlas_capacity {
+                    return false;
+                }
+                tlas_nodes.resize(self.tlas_capacity as usize, BvhNode::default());
+                ctxt.write_buffer(&self.bvh, 0, bytemuck::cast_slice(&tlas_nodes));
+
+                let instances: Vec<RtInstance> = inst_order
+                    .iter()
+                    .map(|&i| {
+                        let mut inst = self.template_instances[i as usize];
+                        let desc = self.mesh_descs[inst.mesh_id as usize];
+                        inst.node_offset = self.tlas_capacity + desc.node_offset;
+                        inst.tri_offset = desc.tri_offset;
+                        inst
+                    })
+                    .collect();
+                ctxt.write_buffer(&self.instances, 0, bytemuck::cast_slice(&instances));
+            }
+            RayBackend::Hardware => {
+                let Some(tlas) = self.tlas.as_mut() else {
+                    return false;
+                };
+                if self.template_instances.is_empty() {
+                    self.xform_hash = xform_hash;
+                    return true;
+                }
+                ctxt.write_buffer(
+                    &self.instances,
+                    0,
+                    bytemuck::cast_slice(&self.template_instances),
+                );
+                for (i, inst) in self.template_instances.iter().enumerate() {
+                    tlas[i] = Some(wgpu::TlasInstance::new(
+                        &self._blas[inst.mesh_id as usize],
+                        transform_3x4(&inst.object_to_world),
+                        i as u32,
+                        0xFF,
+                    ));
+                }
+                let mut encoder = ctxt.create_command_encoder(Some("rt_tlas_update"));
+                encoder
+                    .build_acceleration_structures(std::iter::empty(), std::iter::once(&*tlas));
+                ctxt.submit(std::iter::once(encoder.finish()));
+            }
+        }
+
+        self.xform_hash = xform_hash;
+        true
     }
 }
 

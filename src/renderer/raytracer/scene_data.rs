@@ -273,8 +273,14 @@ pub struct RtScene {
     /// Fog falloff encoding `(mode, param_a, param_b, height_falloff)` from
     /// [`Fog::params`](crate::light::Fog).
     pub fog_params: [f32; 4],
-    /// Content hash used to detect changes that require a GPU rebuild.
-    pub hash: u64,
+    /// Content hash of everything except world transforms (mesh geometry,
+    /// materials, textures, instance counts/colors, skin palettes, morph
+    /// weights, lights, scene globals). A change requires a full GPU rebuild.
+    pub geom_hash: u64,
+    /// Content hash of the world transforms only (node poses/scales and
+    /// per-instance offsets/deformations). A change with an unchanged
+    /// [`Self::geom_hash`] only needs the instance/TLAS fast path.
+    pub xform_hash: u64,
 }
 
 impl RtScene {
@@ -329,6 +335,7 @@ impl Fnv {
 /// `render_layers` is the camera's render-layer mask: an object is gathered only
 /// when its own `render_layers` shares a bit with it (matching the rasterizer).
 pub fn gather(scene: &SceneNode3d, lights: &LightCollection, render_layers: u32) -> RtScene {
+    let mut xform_hasher = Fnv::new();
     let mut out = RtScene {
         ambient: lights.ambient,
         ambient_color: [
@@ -649,10 +656,11 @@ pub fn gather(scene: &SceneNode3d, lights: &LightCollection, render_layers: u32)
             }
         }
 
-        hash_object(&mut hasher, pose, scale, odata, coords.len(), faces.len());
+        hash_object(&mut hasher, odata, coords.len(), faces.len());
         hash_instances(&mut hasher, &instances);
         hash_skin(&mut hasher, odata);
         hash_morph(&mut hasher, odata);
+        hash_transforms(&mut xform_hasher, pose, scale, &instances);
     });
 
     // Lights also influence the rendered image; fold them into the hash so a
@@ -663,7 +671,8 @@ pub fn gather(scene: &SceneNode3d, lights: &LightCollection, render_layers: u32)
     }
     hash_scene_globals(&mut hasher, lights);
 
-    out.hash = hasher.0;
+    out.geom_hash = hasher.0;
+    out.xform_hash = xform_hasher.0;
     out
 }
 
@@ -688,13 +697,19 @@ fn hash_scene_globals(h: &mut Fnv, lights: &LightCollection) {
     }
 }
 
-/// Computes the same content hash as [`gather`] without building the (expensive)
-/// vertex/triangle/material arrays. Used every frame to detect whether the GPU
-/// scene must be rebuilt; only on a change does the full [`gather`] run. Must apply
-/// the same `render_layers` filter as [`gather`] so toggling the camera mask is
-/// detected as a change.
-pub fn scene_hash(scene: &SceneNode3d, lights: &LightCollection, render_layers: u32) -> u64 {
+/// Computes the same `(geom_hash, xform_hash)` pair as [`gather`] without building
+/// the (expensive) vertex/triangle/material arrays. Used every frame to detect
+/// whether the GPU scene must be rebuilt (geometry change) or only its instance
+/// transforms updated (transform change); only on a geometry change does the full
+/// [`gather`] run. Must apply the same `render_layers` filter as [`gather`] so
+/// toggling the camera mask is detected as a change.
+pub fn scene_hashes(
+    scene: &SceneNode3d,
+    lights: &LightCollection,
+    render_layers: u32,
+) -> (u64, u64) {
     let mut hasher = Fnv::new();
+    let mut xform_hasher = Fnv::new();
 
     scene.apply_to_visible_scene_nodes_recursive(&mut |node| {
         let pose = node.world_pose();
@@ -720,10 +735,12 @@ pub fn scene_hash(scene: &SceneNode3d, lights: &LightCollection, render_layers: 
         }
 
         let odata = obj.data();
-        hash_object(&mut hasher, pose, scale, odata, ncoords, nfaces);
-        hash_instances(&mut hasher, &obj.instances().borrow());
+        hash_object(&mut hasher, odata, ncoords, nfaces);
+        let instances = obj.instances().borrow();
+        hash_instances(&mut hasher, &instances);
         hash_skin(&mut hasher, odata);
         hash_morph(&mut hasher, odata);
+        hash_transforms(&mut xform_hasher, pose, scale, &instances);
     });
 
     for cl in &lights.lights {
@@ -731,7 +748,106 @@ pub fn scene_hash(scene: &SceneNode3d, lights: &LightCollection, render_layers: 
     }
     hash_scene_globals(&mut hasher, lights);
 
-    hasher.0
+    (hasher.0, xform_hasher.0)
+}
+
+/// Walks the scene graph and returns one object→world matrix per instance, in
+/// exactly the order [`gather`] emits instances (same filters, same per-object
+/// instance loop). Skinned meshes are world-baked by `gather` and placed with a
+/// single identity instance, so they contribute one identity matrix here.
+///
+/// Used by the transform-only fast path: when [`scene_hashes`] reports an
+/// unchanged geometry hash, these matrices are the only thing that moved, and
+/// `GpuScene::update_transforms` consumes them without a full rebuild.
+pub fn gather_transforms(scene: &SceneNode3d, render_layers: u32) -> Vec<Mat4> {
+    let mut out = Vec::new();
+
+    scene.apply_to_visible_scene_nodes_recursive(&mut |node| {
+        let pose = node.world_pose();
+        let scale = node.world_scale();
+        let data = node.data();
+
+        let Some(obj) = data.object() else {
+            return;
+        };
+        if !obj.data().surface_rendering_active() {
+            return;
+        }
+        if obj.data().render_layers() & render_layers == 0 {
+            return;
+        }
+
+        let mesh = obj.mesh().borrow();
+        if mesh.coords().read().unwrap().len() == 0 || mesh.faces().read().unwrap().len() == 0 {
+            return;
+        }
+
+        let odata = obj.data();
+        // Mirrors `gather`'s `use_skin`: a skinned mesh whose palette is ready is
+        // baked in world space and placed by a single identity instance.
+        let use_skin = odata.has_skin()
+            && mesh.has_skin_vertices()
+            && odata.skin().is_some_and(|s| !s.palette().is_empty());
+
+        let instances = obj.instances().borrow();
+        let num_instances = instances.len();
+        if num_instances == 0 {
+            return;
+        }
+        if use_skin {
+            out.push(Mat4::IDENTITY);
+            return;
+        }
+        let inst_positions = instances.positions.data().as_ref();
+        let inst_deformations = instances.deformations.data().as_ref();
+        for inst in 0..num_instances {
+            let inst_pos = inst_positions
+                .and_then(|p| p.get(inst))
+                .copied()
+                .unwrap_or(Vec3::ZERO);
+            let deform = match inst_deformations {
+                Some(d) if d.len() >= inst * 3 + 3 => {
+                    Mat3::from_cols(d[inst * 3], d[inst * 3 + 1], d[inst * 3 + 2])
+                }
+                _ => Mat3::IDENTITY,
+            };
+            out.push(
+                Mat4::from_translation(pose.translation + inst_pos)
+                    * Mat4::from_quat(pose.rotation)
+                    * Mat4::from_mat3(deform)
+                    * Mat4::from_scale(scale),
+            );
+        }
+    });
+
+    out
+}
+
+/// Folds an object's world transform (node pose/scale plus per-instance offsets
+/// and deformations) into the transform hash. Must hash exactly the same bytes in
+/// [`gather`] and [`scene_hashes`].
+fn hash_transforms(
+    h: &mut Fnv,
+    pose: glamx::Pose3,
+    scale: Vec3,
+    instances: &InstancesBuffer3d,
+) {
+    h.write_vec3(pose.translation);
+    h.write_f32(pose.rotation.x);
+    h.write_f32(pose.rotation.y);
+    h.write_f32(pose.rotation.z);
+    h.write_f32(pose.rotation.w);
+    h.write_vec3(scale);
+    if let Some(p) = instances.positions.data() {
+        for v in p {
+            h.write_vec3(*v);
+        }
+    }
+    if let Some(d) = instances.deformations.data() {
+        for v in d {
+            h.write_vec3(*v);
+        }
+    }
 }
 
 /// Folds an object's instance data (count, per-instance offsets, deformations and
@@ -818,18 +934,11 @@ fn hash_morph(h: &mut Fnv, odata: &crate::scene::ObjectData3d) {
     }
 }
 
+/// Folds the geometry-hash side of an object's instances: the count and the
+/// per-instance colors (which bake into materials). The per-instance offsets and
+/// deformations are transform-side; see [`hash_transforms`].
 fn hash_instances(h: &mut Fnv, instances: &InstancesBuffer3d) {
     h.write_u32(instances.len() as u32);
-    if let Some(p) = instances.positions.data() {
-        for v in p {
-            h.write_vec3(*v);
-        }
-    }
-    if let Some(d) = instances.deformations.data() {
-        for v in d {
-            h.write_vec3(*v);
-        }
-    }
     if let Some(c) = instances.colors.data() {
         for v in c {
             for x in v {
@@ -839,24 +948,12 @@ fn hash_instances(h: &mut Fnv, instances: &InstancesBuffer3d) {
     }
 }
 
-/// Hashes the cheap-but-discriminating bits of an object: world transform,
-/// material and element counts. Per-vertex deformation is intentionally not
-/// hashed (too costly); callers mutating vertices in place use
+/// Hashes the cheap-but-discriminating geometry-side bits of an object: material
+/// and element counts (its world transform is hashed by [`hash_transforms`]).
+/// Per-vertex deformation is intentionally not hashed (too costly); callers
+/// mutating vertices in place use
 /// [`RayTracer::mark_dirty`](crate::renderer::RayTracer::mark_dirty).
-fn hash_object(
-    h: &mut Fnv,
-    pose: glamx::Pose3,
-    scale: Vec3,
-    odata: &crate::scene::ObjectData3d,
-    ncoords: usize,
-    nfaces: usize,
-) {
-    h.write_vec3(pose.translation);
-    h.write_f32(pose.rotation.x);
-    h.write_f32(pose.rotation.y);
-    h.write_f32(pose.rotation.z);
-    h.write_f32(pose.rotation.w);
-    h.write_vec3(scale);
+fn hash_object(h: &mut Fnv, odata: &crate::scene::ObjectData3d, ncoords: usize, nfaces: usize) {
     h.write_f32(odata.metallic());
     h.write_f32(odata.roughness());
     let color = odata.color();
